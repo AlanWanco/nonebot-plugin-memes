@@ -36,12 +36,14 @@ from nonebot_plugin_alconna import (
     Image,
     MultiVar,
     Option,
+    SupportAdapter,
     Text,
     UniMessage,
     UniMsg,
     on_alconna,
     store_false,
     store_true,
+    uniseg,
 )
 from nonebot_plugin_alconna.builtins.extensions.reply import ReplyMergeExtension
 from nonebot_plugin_alconna.uniseg.tools import image_fetch
@@ -56,6 +58,24 @@ from .utils import UserId
 alc_config.command_max_count += 1000
 
 
+REACTION_CODES = {
+    "resolving": ("424", "👀"),
+    "done": ("144", "🎉"),
+    "fail": ("10060", "❌"),
+}
+
+
+async def message_reaction(event: Event, status: str) -> None:
+    try:
+        message_id = uniseg.get_message_id(event)
+        target = uniseg.get_target(event)
+        onebot_code, emoji = REACTION_CODES[status]
+        reaction = onebot_code if target.adapter in (SupportAdapter.onebot11, SupportAdapter.qq) else emoji
+        await uniseg.message_reaction(reaction, message_id)
+    except Exception:
+        logger.debug("发送表情反应失败", exc_info=True)
+
+
 async def process(
     bot: Bot,
     event: Event,
@@ -67,7 +87,15 @@ async def process(
     texts: list[str],
     options: dict[str, Any] = {},
     show_info: bool = False,
+    reaction_event: Optional[Event] = None,
 ):
+    async def finish_failure(message: Optional[str] = None):
+        if reaction_event:
+            await message_reaction(reaction_event, "fail")
+        if message is None:
+            await matcher.finish()
+        await matcher.finish(message)
+
     meme_images: list[MemeImage] = []
 
     try:
@@ -77,49 +105,61 @@ async def process(
                 raise NotImplementedError
             meme_images.append(MemeImage(image.name, result))
     except NotImplementedError:
-        await matcher.finish("当前平台可能不支持下载图片")
+        await finish_failure("当前平台可能不支持下载图片")
     except AdapterException:
         logger.warning(traceback.format_exc())
-        await matcher.finish("图片下载出错")
+        await finish_failure("图片下载出错")
 
-    result = await run_sync(meme.generate)(meme_images, texts, options)
+    try:
+        result = await run_sync(meme.generate)(meme_images, texts, options)
+    except Exception:
+        if reaction_event:
+            await message_reaction(reaction_event, "fail")
+        raise
 
     if isinstance(result, ImageDecodeError):
-        await matcher.finish(f"图片解码出错：{result.error}")
+        await finish_failure(f"图片解码出错：{result.error}")
     elif isinstance(result, ImageEncodeError):
-        await matcher.finish(f"图片编码出错：{result.error}")
+        await finish_failure(f"图片编码出错：{result.error}")
     elif isinstance(result, ImageAssetMissing):
-        await matcher.finish(f"缺少图片资源：{result.path}")
+        await finish_failure(f"缺少图片资源：{result.path}")
     elif isinstance(result, DeserializeError):
-        await matcher.finish(f"表情选项解析出错：{result.error}")
+        await finish_failure(f"表情选项解析出错：{result.error}")
     elif isinstance(result, ImageNumberMismatch):
         num = (
             f"{result.min} ~ {result.max}"
             if result.min != result.max
             else str(result.min)
         )
-        await matcher.finish(f"图片数量不符，应为 {num}，实际传入 {result.actual}")
+        await finish_failure(f"图片数量不符，应为 {num}，实际传入 {result.actual}")
     elif isinstance(result, TextNumberMismatch):
         num = (
             f"{result.min} ~ {result.max}"
             if result.min != result.max
             else str(result.min)
         )
-        await matcher.finish(f"文字数量不符，应为 {num}，实际传入 {result.actual}")
+        await finish_failure(f"文字数量不符，应为 {num}，实际传入 {result.actual}")
     elif isinstance(result, TextOverLength):
         text = result.text
         repr = text if len(text) <= 10 else (text[:10] + "...")
-        await matcher.finish(f"文字过长：{repr}")
+        await finish_failure(f"文字过长：{repr}")
     elif isinstance(result, MemeFeedback):
-        await matcher.finish(result.feedback)
+        await finish_failure(result.feedback)
 
-    await record_meme_generation(session, meme.key)
+    try:
+        await record_meme_generation(session, meme.key)
+    except Exception:
+        if reaction_event:
+            await message_reaction(reaction_event, "fail")
+        raise
 
     msg = UniMessage()
     if show_info:
         keywords = "、".join([f'"{keyword}"' for keyword in meme.info.keywords])
         msg += f"关键词：{keywords}"
     msg += UniMessage.image(raw=result)
+    if reaction_event:
+        await message_reaction(reaction_event, "done")
     await msg.finish()
 
 
@@ -482,6 +522,7 @@ async def _(
     interface: QryItrface,
     alc_matches: AlcMatches,
 ):
+    await message_reaction(event, "resolving")
     meme_params: list[T_MemeParams] = list(alc_matches.query(meme_params_key, ()))
     texts, images, names = await handle_params(session, interface, meme_params)
     for i in range(len(names)):
@@ -498,6 +539,7 @@ async def _(
         )
     ]
     if not available_memes:
+        await message_reaction(event, "fail")
         await matcher.finish("找不到符合参数数量的表情")
 
     random_meme = random.choice(available_memes)
@@ -511,4 +553,5 @@ async def _(
         images,
         texts,
         show_info=memes_config.memes_random_meme_show_info,
+        reaction_event=event,
     )
