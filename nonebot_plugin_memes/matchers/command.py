@@ -1,9 +1,13 @@
+import asyncio
 import random
 import traceback
+from functools import wraps
 from itertools import chain
 from typing import Any, Optional, Union
 
+from arclet.alconna import Arparma
 from arclet.alconna import config as alc_config
+from arclet.alconna.exceptions import SpecialOptionTriggered
 from meme_generator import (
     BooleanOption,
     DeserializeError,
@@ -23,7 +27,7 @@ from meme_generator import (
 from meme_generator import Image as MemeImage
 from nonebot import get_driver
 from nonebot.adapters import Bot, Event
-from nonebot.exception import AdapterException
+from nonebot.exception import AdapterException, FinishedException
 from nonebot.log import logger
 from nonebot.matcher import Matcher
 from nonebot.typing import T_Handler, T_State
@@ -46,6 +50,7 @@ from nonebot_plugin_alconna import (
     uniseg,
 )
 from nonebot_plugin_alconna.builtins.extensions.reply import ReplyMergeExtension
+from nonebot_plugin_alconna.extension import Extension, OutputType
 from nonebot_plugin_alconna.uniseg.tools import image_fetch
 from nonebot_plugin_uninfo import Interface, QryItrface, Session, Uninfo, User
 from nonebot_plugin_waiter import waiter
@@ -65,15 +70,76 @@ REACTION_CODES = {
 }
 
 
-async def message_reaction(event: Event, status: str) -> None:
+async def message_reaction(
+    event: Event, status: str, bot: Optional[Bot] = None
+) -> None:
     try:
-        message_id = uniseg.get_message_id(event)
-        target = uniseg.get_target(event)
+        message_id = uniseg.get_message_id(event, bot=bot)
+        target = uniseg.get_target(event, bot=bot)
         onebot_code, emoji = REACTION_CODES[status]
-        reaction = onebot_code if target.adapter in (SupportAdapter.onebot11, SupportAdapter.qq) else emoji
-        await uniseg.message_reaction(reaction, message_id)
+        reaction = (
+            onebot_code
+            if target.adapter in (SupportAdapter.onebot11, SupportAdapter.qq)
+            else emoji
+        )
+        await uniseg.message_reaction(reaction, message_id, event=event, bot=bot)
     except Exception:
         logger.debug("发送表情反应失败", exc_info=True)
+
+
+class MemeReactionExtension(Extension):
+    priority = 10
+    id = "memes.reaction"
+
+    def __init__(self, meme: Optional[Meme] = None):
+        self.meme = meme
+
+    async def can_react(self) -> bool:
+        if self.meme is None:
+            return True
+        user_id = await self.inject(("user_id", UserId))
+        return meme_manager.check(user_id, self.meme.key)
+
+    async def output_converter(
+        self, output_type: OutputType, content: str
+    ) -> UniMessage:
+        if output_type == "error" and await self.can_react():
+            event = await self.inject(("event", Event))
+            bot = await self.inject(("bot", Bot))
+            await message_reaction(event, "fail", bot=bot)
+        return UniMessage(content)
+
+    async def parse_wrapper(
+        self, bot: Bot, state: T_State, event: Event, res: Arparma
+    ) -> None:
+        if (
+            res.head_matched
+            and not res.matched
+            and not isinstance(res.error_info, SpecialOptionTriggered)
+            and await self.can_react()
+        ):
+            await message_reaction(event, "fail", bot=bot)
+
+
+def react_on_error(func: T_Handler) -> T_Handler:
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except FinishedException:
+            raise
+        except (Exception, asyncio.CancelledError):
+            event = kwargs.get("event")
+            if event is None and len(args) > 1:
+                event = args[1]
+            if event is not None:
+                bot = kwargs.get("bot")
+                if bot is None and args:
+                    bot = args[0]
+                await message_reaction(event, "fail", bot=bot)
+            raise
+
+    return wrapper
 
 
 async def process(
@@ -91,7 +157,7 @@ async def process(
 ):
     async def finish_failure(message: Optional[str] = None):
         if reaction_event:
-            await message_reaction(reaction_event, "fail")
+            await message_reaction(reaction_event, "fail", bot=bot)
         if message is None:
             await matcher.finish()
         await matcher.finish(message)
@@ -110,12 +176,7 @@ async def process(
         logger.warning(traceback.format_exc())
         await finish_failure("图片下载出错")
 
-    try:
-        result = await run_sync(meme.generate)(meme_images, texts, options)
-    except Exception:
-        if reaction_event:
-            await message_reaction(reaction_event, "fail")
-        raise
+    result = await run_sync(meme.generate)(meme_images, texts, options)
 
     if isinstance(result, ImageDecodeError):
         await finish_failure(f"图片解码出错：{result.error}")
@@ -146,21 +207,17 @@ async def process(
     elif isinstance(result, MemeFeedback):
         await finish_failure(result.feedback)
 
-    try:
-        await record_meme_generation(session, meme.key)
-    except Exception:
-        if reaction_event:
-            await message_reaction(reaction_event, "fail")
-        raise
+    await record_meme_generation(session, meme.key)
 
     msg = UniMessage()
     if show_info:
         keywords = "、".join([f'"{keyword}"' for keyword in meme.info.keywords])
         msg += f"关键词：{keywords}"
     msg += UniMessage.image(raw=result)
+    await msg.send()
     if reaction_event:
-        await message_reaction(reaction_event, "done")
-    await msg.finish()
+        await message_reaction(reaction_event, "done", bot=bot)
+    await matcher.finish()
 
 
 T_MemeParams = Union[Text, Image, At]
@@ -294,7 +351,8 @@ def create_matcher(meme: Meme):
             Alconna(prefixes, keyword, *options, arg_meme_params),
             block=False,
             priority=12,
-            extensions=[ReplyMergeExtension()],
+            skip_for_unmatch=False,
+            extensions=[ReplyMergeExtension(), MemeReactionExtension(meme)],
         )
         matcher.append_handler(keyword_handler)
 
@@ -303,13 +361,15 @@ def create_matcher(meme: Meme):
             Alconna(prefixes, f"re:{shortcut.pattern}", *options, arg_meme_params),
             block=False,
             priority=12,
-            extensions=[ReplyMergeExtension()],
+            skip_for_unmatch=False,
+            extensions=[ReplyMergeExtension(), MemeReactionExtension(meme)],
         )
         shortcut_handler = create_handler(meme, shortcut)
         matcher.append_handler(shortcut_handler)
 
 
 def create_handler(meme: Meme, shortcut: Optional[MemeShortcut] = None) -> T_Handler:
+    @react_on_error
     async def handler(
         bot: Bot,
         event: Event,
@@ -320,9 +380,17 @@ def create_handler(meme: Meme, shortcut: Optional[MemeShortcut] = None) -> T_Han
         interface: QryItrface,
         alc_matches: AlcMatches,
     ):
+        if not alc_matches.matched:
+            return
         if not meme_manager.check(user_id, meme.key):
             logger.info(f"用户 {user_id} 表情 {meme.key} 被禁用")
             return
+
+        await message_reaction(event, "resolving", bot=bot)
+
+        async def finish_failure(message: Optional[str] = None):
+            await message_reaction(event, "fail", bot=bot)
+            await matcher.finish(message)
 
         texts: list[str] = []
         images: list[Image] = []
@@ -422,11 +490,11 @@ def create_handler(meme: Meme, shortcut: Optional[MemeShortcut] = None) -> T_Han
             msg = f"文字数量不符，应为 {text_range}，实际传入 {len(texts)}"
             if policy.too_few_text == "ignore":
                 logger.info(msg)
-                await matcher.finish()
+                await finish_failure()
 
             if policy.too_few_text == "prompt":
                 matcher.stop_propagation()
-                await matcher.finish(msg)
+                await finish_failure(msg)
 
             elif policy.too_few_text == "get":
                 while len(texts) < params.min_texts:
@@ -436,7 +504,7 @@ def create_handler(meme: Meme, shortcut: Optional[MemeShortcut] = None) -> T_Han
                     await matcher.send(f"请继续发送 {num} 段文字")
                     resp = await get_texts.wait(timeout=30)
                     if resp is None:
-                        await matcher.finish()
+                        await finish_failure()
                     texts.extend(resp)
                     texts = texts[: params.max_texts]
 
@@ -444,11 +512,11 @@ def create_handler(meme: Meme, shortcut: Optional[MemeShortcut] = None) -> T_Han
             msg = f"文字数量不符，应为 {text_range}，实际传入 {len(texts)}"
             if policy.too_much_text == "ignore":
                 logger.info(msg)
-                await matcher.finish()
+                await finish_failure()
 
             if policy.too_much_text == "prompt":
                 matcher.stop_propagation()
-                await matcher.finish(msg)
+                await finish_failure(msg)
 
             elif policy.too_much_text == "drop":
                 texts = texts[: params.max_texts]
@@ -457,11 +525,11 @@ def create_handler(meme: Meme, shortcut: Optional[MemeShortcut] = None) -> T_Han
             msg = f"图片数量不符，应为 {image_range}，实际传入 {len(images)}"
             if policy.too_few_image == "ignore":
                 logger.info(msg)
-                await matcher.finish()
+                await finish_failure()
 
             if policy.too_few_image == "prompt":
                 matcher.stop_propagation()
-                await matcher.finish(msg)
+                await finish_failure(msg)
 
             elif policy.too_few_image == "get":
                 while len(images) < params.min_images:
@@ -471,7 +539,7 @@ def create_handler(meme: Meme, shortcut: Optional[MemeShortcut] = None) -> T_Han
                     await matcher.send(f"请继续发送 {num} 张图片")
                     resp = await get_images.wait(timeout=30)
                     if resp is None:
-                        await matcher.finish()
+                        await finish_failure()
                     images.extend(resp)
                     images = images[: params.max_images]
 
@@ -479,17 +547,28 @@ def create_handler(meme: Meme, shortcut: Optional[MemeShortcut] = None) -> T_Han
             msg = f"图片数量不符，应为 {image_range}，实际传入 {len(images)}"
             if policy.too_much_image == "ignore":
                 logger.info(msg)
-                await matcher.finish()
+                await finish_failure()
 
             if policy.too_much_image == "prompt":
                 matcher.stop_propagation()
-                await matcher.finish(msg)
+                await finish_failure(msg)
 
             elif policy.too_much_image == "drop":
                 images = images[: params.max_images]
 
         matcher.stop_propagation()
-        await process(bot, event, state, matcher, session, meme, images, texts, options)
+        await process(
+            bot,
+            event,
+            state,
+            matcher,
+            session,
+            meme,
+            images,
+            texts,
+            options,
+            reaction_event=event,
+        )
 
     return handler
 
@@ -507,11 +586,13 @@ random_matcher = on_alconna(
     block=False,
     priority=12,
     use_cmd_start=True,
-    extensions=[ReplyMergeExtension()],
+    skip_for_unmatch=False,
+    extensions=[ReplyMergeExtension(), MemeReactionExtension()],
 )
 
 
 @random_matcher.handle()
+@react_on_error
 async def _(
     bot: Bot,
     event: Event,
@@ -522,7 +603,9 @@ async def _(
     interface: QryItrface,
     alc_matches: AlcMatches,
 ):
-    await message_reaction(event, "resolving")
+    if not alc_matches.matched:
+        return
+    await message_reaction(event, "resolving", bot=bot)
     meme_params: list[T_MemeParams] = list(alc_matches.query(meme_params_key, ()))
     texts, images, names = await handle_params(session, interface, meme_params)
     for i in range(len(names)):
@@ -539,7 +622,7 @@ async def _(
         )
     ]
     if not available_memes:
-        await message_reaction(event, "fail")
+        await message_reaction(event, "fail", bot=bot)
         await matcher.finish("找不到符合参数数量的表情")
 
     random_meme = random.choice(available_memes)
