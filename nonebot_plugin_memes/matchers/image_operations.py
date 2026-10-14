@@ -23,6 +23,7 @@ from nonebot_plugin_alconna import (
 from nonebot_plugin_alconna.builtins.extensions.reply import ReplyMergeExtension
 from nonebot_plugin_alconna.uniseg.tools import image_fetch
 
+from .command import MemeReactionExtension, message_reaction, react_on_error
 from .utils import send_multiple_images
 
 
@@ -194,7 +195,8 @@ async def _(matcher: Matcher):
     await matcher.finish(
         "简单图片操作，支持的操作：\n"
         + "\n".join(
-            f"{i+1}、{'/'.join(command.keywords)}" for i, command in enumerate(commands)
+            f"{i + 1}、{'/'.join(command.keywords)}"
+            for i, command in enumerate(commands)
         )
     )
 
@@ -206,10 +208,12 @@ def create_matcher(command: Command):
         block=True,
         priority=11,
         use_cmd_start=True,
-        extensions=[ReplyMergeExtension()],
+        skip_for_unmatch=False,
+        extensions=[ReplyMergeExtension(), MemeReactionExtension()],
     )
 
     @command_matcher.handle()
+    @react_on_error
     async def _(
         bot: Bot,
         event: Event,
@@ -217,6 +221,14 @@ def create_matcher(command: Command):
         matcher: Matcher,
         alc_matches: AlcMatches,
     ):
+        if not alc_matches.matched:
+            return
+        await message_reaction(event, "resolving", bot=bot)
+
+        async def finish_failure(message: str):
+            await message_reaction(event, "fail", bot=bot)
+            await matcher.finish(message)
+
         async def fetch_image(image: Image):
             try:
                 result = await image_fetch(event, bot, state, image)
@@ -224,10 +236,10 @@ def create_matcher(command: Command):
                     raise NotImplementedError
                 return result
             except NotImplementedError:
-                await matcher.finish("当前平台可能不支持下载图片")
+                await finish_failure("当前平台可能不支持下载图片")
             except AdapterException:
                 logger.warning(traceback.format_exc())
-                await matcher.finish("图片下载出错")
+                await finish_failure("图片下载出错")
 
         args = alc_matches.all_matched_args
         if image := args.get("img"):
@@ -238,15 +250,21 @@ def create_matcher(command: Command):
         result = await run_sync(command.func)(**args)
 
         if isinstance(result, str):
-            await matcher.finish(result)
+            await finish_failure(result)
         elif isinstance(result, bytes):
             await UniMessage.image(raw=result).send()
         elif isinstance(result, list):
+            if not result:
+                await finish_failure("图片处理未生成可发送的图片")
             await send_multiple_images(bot, event, result)
         elif isinstance(result, ImageDecodeError):
-            await matcher.finish(f"图片解码出错：{result.error}")
+            await finish_failure(f"图片解码出错：{result.error}")
         elif isinstance(result, ImageEncodeError):
-            await matcher.finish(f"图片编码出错：{result.error}")
+            await finish_failure(f"图片编码出错：{result.error}")
+        else:
+            await finish_failure("图片处理失败，请检查图片或参数")
+
+        await message_reaction(event, "done", bot=bot)
 
 
 def create_matchers():

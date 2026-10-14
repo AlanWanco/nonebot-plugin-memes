@@ -7,7 +7,7 @@ from ..manager import meme_manager
 
 search_matcher = on_alconna(
     Alconna("表情搜索", Args["meme_name", str]),
-    aliases={"表情查找", "表情查询"},
+    aliases={"表情包搜索", "表情查找", "表情查询"},
     block=True,
     priority=11,
     use_cmd_start=True,
